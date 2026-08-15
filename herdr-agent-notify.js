@@ -8,12 +8,16 @@
  *
  * 事件模型（经实测验证，protocol 19）：
  *   - 全局事件流：订阅 type 用点号（pane.updated / pane.exited ...），推送的事件名是
- *     下划线（pane_updated / pane_exited ...），覆盖所有被服务器监视的 pane；
- *   - 订阅事件：点号名（pane.agent_status_changed），按 pane 过滤，是状态转换的主通道
+ *     下划线（pane_updated / pane_exited ...），覆盖所有被服务器监视的 pane，但高频
+ *     （~100ms-1s）且携带检测循环伪影状态（idle/unknown 每秒翻转）；
+ *   - 订阅事件：点号名（pane.agent_status_changed），按 pane 过滤，真实转换的主通道
  *     （report_agent 驱动、无终端输出的转换只发此事件）；
- *   - handleEvent 统一做 下划线->点号 归一化，两种事件名都能命中；
+ *   - 优先级：已跟踪（已订阅）pane 的状态只信 status_changed，pane_updated 仅补充
+ *     元数据——避免伪影状态把一次转换拆成两次（双弹）或吞掉真实终态（漏报）；
+ *     未跟踪的新 pane 由 pane_updated best-effort 覆盖，待 refresh 补订阅后交接；
+ *   - 10s 冷却期（--cooldown-ms）：同一 pane 短时间内不重复弹窗，兜底防双弹；
  *   - pane_agent_detected 是检测循环信号（同 pane 高频重复、released/final_status
- *     不可靠），忽略；其状态变化总会伴随 pane_updated 或 status_changed，由这两路覆盖。
+ *     不可靠），忽略；其状态变化总会伴随 status_changed 或 pane_updated，由两路覆盖。
  * 互补 + 定时刷新（默认 30s）：
  *   - 事件流在线时，状态以事件为准，快照 diff 只兑底丢失的事件（working->终态）；
  *   - 快照新增 pane 才重建订阅（补 per-pane 状态订阅），瞬时 pane（检测伪影）静默修剪；
@@ -25,7 +29,9 @@
  *   node herdr-agent-notify.js
  *   node ... --name pi              # 只监控名为 pi 的 agent
  *   node ... --refresh-ms 10000     # 订阅刷新间隔（默认 30000）
+ *   node ... --cooldown-ms 5000     # 同 pane 重复通知冷却期（默认 10000）
  *   node ... --include-self         # 也监控自身 pane（默认跳过）
+ *   node ... --debug                # 打印每次状态转换（排查双弹/漏报）
  * 插件命令由 herdr 以插件目录为 cwd 启动，相对路径即可；日志经 herdr 插件日志
  * 或 HERDR_PLUGIN_STATE_DIR 落盘，不写入插件根目录。
  */
@@ -43,9 +49,12 @@ const refreshArg = parseInt(arg('--refresh-ms') || '30000', 10);
 const OPTS = {
   nameFilter: arg('--name') || null,
   includeSelf: process.argv.includes('--include-self'),
-  selfPane: process.env.HERDR_PANE_ID || null,
   refreshMs: Number.isFinite(refreshArg) ? Math.max(1000, refreshArg) : 30000,
+  cooldownMs: Number.isFinite(parseInt(arg('--cooldown-ms') || '10000', 10)) ? Math.max(0, parseInt(arg('--cooldown-ms') || '10000', 10)) : 10000,
+  debug: process.argv.includes('--debug'),
 };
+
+const dbg = (...a) => { if (OPTS.debug) log('dbg:', ...a); };
 
 const LABELS = { idle: '空闲', working: '工作中', blocked: '需要你确认', done: '已完成', unknown: '状态未知' };
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
@@ -86,6 +95,8 @@ let rpcOnce = (method, params, timeoutMs = 8000) => {
 
 /** pane_id -> agent_status：快照对齐 + 事件增量更新 */
 const state = new Map();
+/** 已建立 per-pane 订阅的 pane：其状态只信 status_changed（pane_updated 高频伪影不进状态机） */
+const subscribed = new Set();
 
 /** pane_id -> { title, workspace_id }：通知展示用的 pane 上下文（事件/快照补充） */
 const paneMeta = new Map();
@@ -118,12 +129,18 @@ function buildSubs() {
 /** 完成态：working 之后值得通知的状态 */
 const TERMINAL = new Set(['idle', 'done', 'blocked']);
 
+/** pane_id -> 上次通知时间戳：冷却期内同一 pane 不重复弹（防检测循环/多轮任务双弹） */
+const lastNotifyAt = new Map();
+
 /** 通知判定（不操作 state）：prev=working 且 cur 为完成态时通知 */
 function maybeNotify(pid, name, prev, cur) {
   if (prev !== 'working') return;
   if (!TERMINAL.has(cur)) return; // unknown/异常状态不打扰
   if (OPTS.nameFilter && name !== OPTS.nameFilter) return;
   if (!OPTS.includeSelf && pid === OPTS.selfPane) return; // 跳过自身 pane
+  const now = Date.now();
+  if (now - (lastNotifyAt.get(pid) ?? 0) < OPTS.cooldownMs) return; // 冷却期内不重复弹
+  lastNotifyAt.set(pid, now);
 
   const who = name ? `${name} (${pid})` : pid;
   const meta = paneMeta.get(pid);
@@ -144,6 +161,7 @@ function maybeNotify(pid, name, prev, cur) {
 function transition(pid, name, cur) {
   const prev = state.get(pid);  // undefined = 首次见到，只记录不通知
   state.set(pid, cur);
+  dbg('transition', pid, prev ?? '?', '->', cur);
   maybeNotify(pid, name, prev, cur);
 }
 
@@ -166,7 +184,7 @@ function handleEvent(msg) {
   const data = msg.data ?? {};
   const ev = normalizeEvent(msg.event);
   if (ev === 'pane.closed' || ev === 'pane.exited') {
-    if (data.pane_id) { state.delete(data.pane_id); paneMeta.delete(data.pane_id); }
+    if (data.pane_id) { state.delete(data.pane_id); paneMeta.delete(data.pane_id); subscribed.delete(data.pane_id); lastNotifyAt.delete(data.pane_id); }
     return;
   }
   if (ev === 'pane.agent_status_changed') {
@@ -178,8 +196,10 @@ function handleEvent(msg) {
     const pane = data.pane;
     if (!pane?.pane_id || !pane.agent) return;               // 无 agent 的 pane 不关心
     setPaneMeta(pane.pane_id, pane.title ?? pane.terminal_title, pane.workspace_id);
-    const st = pane.agent_status ?? 'unknown';
-    if (!REPORTABLE.has(st)) return;                          // unknown 不覆盖 prev=working
+    if (subscribed.has(pane.pane_id)) return;                 // 已订阅：状态以 status_changed 为准，
+                                                              // 忽略检测循环伪影（working/idle 每秒翻转）
+    const st = pane.agent_status ?? 'unknown';                // 未订阅（新 pane/订阅未建立）：best-effort，
+    if (!REPORTABLE.has(st)) return;                          // 待 refresh 补订阅后交给 status_changed
     transition(pane.pane_id, pane.agent ?? pane.display_agent ?? null, st);
   }
 }
@@ -217,6 +237,8 @@ function subscribe() {
   const c = net.connect(PIPE);
   conn = c;
   c.intentional = false;
+  subscribed.clear();
+  for (const pid of state.keys()) subscribed.add(pid);   // 订阅集快照：仅这些 pane 信 status_changed
   let buf = Buffer.alloc(0);
   c.on('connect', () => {
     retryMs = 5000;   // 连接成功：重置退避
@@ -276,7 +298,7 @@ async function refresh(reason) {
         transition(a.pane_id, a.agent ?? a.display_agent ?? null, a.agent_status);  // 事件丢失兜底
       }
     }
-    for (const pid of [...state.keys()]) if (!next.has(pid)) state.delete(pid);   // 瞬时 pane 修剪
+    for (const pid of [...state.keys()]) if (!next.has(pid)) { state.delete(pid); subscribed.delete(pid); lastNotifyAt.delete(pid); }   // 瞬时 pane 修剪
     if (!needSub) return false;
     log('refreshed:', reason, [...state.entries()].map(([p, s]) => `${p}=${s}`).join(', '));
     return true;
@@ -316,7 +338,7 @@ async function main() {
   process.on('SIGTERM', onExit);
 }
 
-module.exports = { PIPE, rpcOnce, state, paneMeta, wsLabels, handleEvent, buildSubs, transition, maybeNotify,
+module.exports = { PIPE, rpcOnce, state, paneMeta, wsLabels, subscribed, handleEvent, buildSubs, transition, maybeNotify,
                    refresh, subscribe, setNotify: (f) => { notifyImpl = f; },
                    setRpc: (f) => { rpcOnce = f; }, LABELS, OPTS };
 if (require.main === module) main();

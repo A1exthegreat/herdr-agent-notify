@@ -19,8 +19,14 @@ herdr server ──named pipe──▶ herdr-agent-notify.js ──notification.
 
 - **Two complementary event channels** (verified against protocol 19): the global
   `pane_updated` stream carries statuses for every watched pane; the per-pane
-  `pane.agent_status_changed` subscription covers output-less transitions. Both are
-  normalized (underscore/dot event names) and deduplicated — one transition, one toast.
+  `pane.agent_status_changed` subscription covers output-less transitions.
+- **No double toasts**: for panes with an active per-pane subscription,
+  `pane_updated` only feeds display metadata — status transitions come from
+  `pane.agent_status_changed` alone. This matters because the global stream also
+  carries high-frequency detection-loop artifacts (`idle`/`unknown` flapping) that
+  would otherwise split one real transition into two toasts (or swallow it). New
+  panes are covered best-effort via `pane_updated` until the next refresh
+  subscribes them; a 10s per-pane cooldown (`--cooldown-ms`) is the final guard.
 - **Self-healing**: exponential backoff reconnect (5s → 60s cap) when the server
   restarts; transitions missed while disconnected are re-notified from the next
   `agent.list` snapshot diff.
@@ -85,7 +91,9 @@ Standalone (no plugin registration needed):
 node herdr-agent-notify.js
 node herdr-agent-notify.js --name pi          # only monitor agent "pi"
 node herdr-agent-notify.js --refresh-ms 10000 # subscription refresh interval
+node herdr-agent-notify.js --cooldown-ms 5000 # per-pane anti-double-toast cooldown (default 10000)
 node herdr-agent-notify.js --include-self     # also monitor your own pane
+node herdr-agent-notify.js --debug            # log every status transition
 ```
 
 Logs: startup-hook runs are captured in `herdr plugin log list --plugin herdr-agent-notify`;

@@ -82,12 +82,14 @@ agents = [{ pane_id: 'w9:p9', agent: 'pi', agent_status: 'done' }];
   assert(notes[notes.length - 1].body === '状态：已完成 · Reflow (w1) · π - 37310', 'body = status + workspace label (id) + pane title');
   // --- 13. fallbacks: no ws label -> raw id; no title -> plain body
   w.wsLabels.clear();
+  w.OPTS.cooldownMs = 0;   // 同一 pane 连续断言，关闭冷却期
   w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:p9', agent: 'pi', agent_status: 'working', title: 'π - 37310', workspace_id: 'w1' } });
   w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:p9', agent: 'pi', agent_status: 'idle', title: 'π - 37310', workspace_id: 'w1' } });
   assert(notes[notes.length - 1].body === '状态：空闲 · w1 · π - 37310', 'no label -> workspace_id only');
   w.handleEvent({ event: 'pane_updated', data: { pane: { pane_id: 'w1:pA', agent: 'pi', agent_status: 'working' } } });
   w.handleEvent({ event: 'pane_updated', data: { pane: { pane_id: 'w1:pA', agent: 'pi', agent_status: 'idle' } } });
   assert(notes[notes.length - 1].body === '状态：空闲', 'no meta -> plain body');
+  w.OPTS.cooldownMs = 10000;
   // --- 14. long title capped at 40 chars; closed removes meta
   const long = 'x'.repeat(60);
   w.handleEvent({ event: 'pane_updated', data: { pane: { pane_id: 'w1:pB', agent: 'pi', agent_status: 'working', title: long, workspace_id: 'w2' } } });
@@ -95,5 +97,32 @@ agents = [{ pane_id: 'w9:p9', agent: 'pi', agent_status: 'done' }];
   assert(notes[notes.length - 1].body.includes('x'.repeat(37) + '…'), 'long title truncated with ellipsis');
   w.handleEvent({ event: 'pane_exited', data: { pane_id: 'w1:pB', workspace_id: 'w1' } });
   assert(!w.paneMeta.has('w1:pB'), 'pane_exited removes pane meta');
+
+  // --- 15. subscribed panes: pane_updated status is ignored (detection-loop artifacts)
+  const n15 = notes.length;
+  w.subscribed.add('w1:pS');
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:pS', agent: 'pi', agent_status: 'working' } });
+  w.handleEvent({ event: 'pane_updated', data: { pane: { pane_id: 'w1:pS', agent: 'pi', agent_status: 'idle' } } });  // artifact must NOT transition
+  assert(w.state.get('w1:pS') === 'working', 'subscribed pane ignores pane_updated artifact');
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:pS', agent: 'pi', agent_status: 'done' } });
+  assert(notes.length === n15 + 1, 'subscribed pane: single notify from status_changed');
+
+  // --- 16. cooldown: second working->terminal within cooldown window is suppressed
+  const n16 = notes.length;
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:pC', agent: 'pi', agent_status: 'working' } });
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:pC', agent: 'pi', agent_status: 'idle' } });
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:pC', agent: 'pi', agent_status: 'working' } });
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:pC', agent: 'pi', agent_status: 'idle' } });  // suppressed
+  assert(notes.length === n16 + 1, 'cooldown suppresses second notify');
+  w.OPTS.cooldownMs = 0;
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:pC', agent: 'pi', agent_status: 'working' } });
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:pC', agent: 'pi', agent_status: 'idle' } });
+  assert(notes.length === n16 + 2, 'cooldown=0 allows notify again');
+  w.OPTS.cooldownMs = 10000;
+
+  // --- 17. subscribed-but-untracked pane: pane_updated still ignored
+  w.subscribed.add('w1:pT');
+  w.handleEvent({ event: 'pane_updated', data: { pane: { pane_id: 'w1:pT', agent: 'pi', agent_status: 'working' } } });
+  assert(w.state.get('w1:pT') === undefined, 'subscribed pane not tracked via pane_updated');
   console.log('done');
 })();
