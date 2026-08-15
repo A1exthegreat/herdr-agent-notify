@@ -18,7 +18,8 @@
  *   - 事件流在线时，状态以事件为准，快照 diff 只兑底丢失的事件（working->终态）；
  *   - 快照新增 pane 才重建订阅（补 per-pane 状态订阅），瞬时 pane（检测伪影）静默修剪；
  *   - 事件流断开期间发生的转换，由重连/刷新时的快照 diff 补发通知。
- * 当 agent 从 working 变为 idle/done/blocked 时通过 notification.show RPC 弹系统通知。
+ * 当 agent 从 working 变为 idle/done/blocked 时通过 notification.show RPC 弹系统通知；
+ * 通知正文带工作区（label + id）与 pane 标题（title，回退 terminal_title，超长截断）。
  *
  * 用法:
  *   node herdr-agent-notify.js
@@ -86,9 +87,24 @@ let rpcOnce = (method, params, timeoutMs = 8000) => {
 /** pane_id -> agent_status：快照对齐 + 事件增量更新 */
 const state = new Map();
 
+/** pane_id -> { title, workspace_id }：通知展示用的 pane 上下文（事件/快照补充） */
+const paneMeta = new Map();
+/** workspace_id -> label：workspace.list 缓存（通知里展示工作区名） */
+const wsLabels = new Map();
+
+/** 合并 pane 展示元数据（title 可为 null，空值不覆盖旧值） */
+function setPaneMeta(pid, title, workspaceId) {
+  const t = typeof title === 'string' ? title.trim() : '';
+  if (!t && !workspaceId) return;
+  const m = paneMeta.get(pid) ?? {};
+  if (t) m.title = t;
+  if (workspaceId) m.workspace_id = workspaceId;
+  paneMeta.set(pid, m);
+}
+
 /** 可注入的通知实现（测试时替换为记录器） */
 let notifyImpl = (title, body, sound) => rpcOnce('notification.show', { title, body, sound }).then(
-  (r) => log('notified:', sound, '|', title, '|', r.result?.reason ?? 'ok'),
+  (r) => log('notified:', sound, '|', title, '|', body, '|', r.result?.reason ?? 'ok'),
   (e) => log('notify failed:', e.message)
 );
 
@@ -110,7 +126,18 @@ function maybeNotify(pid, name, prev, cur) {
   if (!OPTS.includeSelf && pid === OPTS.selfPane) return; // 跳过自身 pane
 
   const who = name ? `${name} (${pid})` : pid;
-  notifyImpl(`agent ${who}`, `状态：${LABELS[cur] ?? cur}`, cur === 'blocked' ? 'request' : 'done');
+  const meta = paneMeta.get(pid);
+  const ctx = [];
+  if (meta?.workspace_id) {
+    const label = wsLabels.get(meta.workspace_id);
+    ctx.push(label ? `${label} (${meta.workspace_id})` : meta.workspace_id);
+  }
+  const t = meta?.title ?? '';
+  if (t) ctx.push(t.length > 40 ? t.slice(0, 37) + '…' : t);
+  const body = ctx.length
+    ? `状态：${LABELS[cur] ?? cur} · ${ctx.join(' · ')}`
+    : `状态：${LABELS[cur] ?? cur}`;
+  notifyImpl(`agent ${who}`, body, cur === 'blocked' ? 'request' : 'done');
 }
 
 /** 状态转换核心：维护 state 并判定是否通知 */
@@ -139,16 +166,18 @@ function handleEvent(msg) {
   const data = msg.data ?? {};
   const ev = normalizeEvent(msg.event);
   if (ev === 'pane.closed' || ev === 'pane.exited') {
-    if (data.pane_id) state.delete(data.pane_id);
+    if (data.pane_id) { state.delete(data.pane_id); paneMeta.delete(data.pane_id); }
     return;
   }
   if (ev === 'pane.agent_status_changed') {
+    if (data.pane_id) setPaneMeta(data.pane_id, data.title, data.workspace_id);
     transition(data.pane_id, data.agent ?? data.display_agent ?? null, data.agent_status ?? 'unknown');
     return;
   }
   if (ev === 'pane.updated') {
     const pane = data.pane;
     if (!pane?.pane_id || !pane.agent) return;               // 无 agent 的 pane 不关心
+    setPaneMeta(pane.pane_id, pane.title ?? pane.terminal_title, pane.workspace_id);
     const st = pane.agent_status ?? 'unknown';
     if (!REPORTABLE.has(st)) return;                          // unknown 不覆盖 prev=working
     transition(pane.pane_id, pane.agent ?? pane.display_agent ?? null, st);
@@ -228,6 +257,13 @@ async function refresh(reason) {
   refreshPending = true;
   try {
     const agents = await snapshotAgents();
+    // 展示元数据：pane title/workspace + 工作区 label 缓存（通知内容用；失败不影响状态同步）
+    for (const a of agents) if (a.pane_id) setPaneMeta(a.pane_id, a.title ?? a.terminal_title, a.workspace_id);
+    try {
+      const ws = await rpcOnce('workspace.list', {});
+      wsLabels.clear();
+      for (const w of ws.result?.workspaces ?? []) if (w.workspace_id && w.label) wsLabels.set(w.workspace_id, w.label);
+    } catch { /* best-effort */ }
     const next = new Map(agents.map((a) => [a.pane_id, a.agent_status]));
     const streamDown = !conn || conn.destroyed;
     let needSub = false;
@@ -280,7 +316,7 @@ async function main() {
   process.on('SIGTERM', onExit);
 }
 
-module.exports = { PIPE, rpcOnce, state, handleEvent, buildSubs, transition, maybeNotify,
+module.exports = { PIPE, rpcOnce, state, paneMeta, wsLabels, handleEvent, buildSubs, transition, maybeNotify,
                    refresh, subscribe, setNotify: (f) => { notifyImpl = f; },
                    setRpc: (f) => { rpcOnce = f; }, LABELS, OPTS };
 if (require.main === module) main();

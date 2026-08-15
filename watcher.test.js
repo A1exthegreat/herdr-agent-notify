@@ -73,5 +73,27 @@ agents = [{ pane_id: 'w9:p9', agent: 'pi', agent_status: 'done' }];
   // --- 11. no change -> false, no notify
   const changed4 = await w.refresh('test4');
   assert(changed4 === false, 'refresh no-change returns false');
+
+  // --- 12. notification content: workspace label + pane title
+  w.paneMeta.clear(); w.wsLabels.clear();
+  w.wsLabels.set('w1', 'Reflow');
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:p9', agent: 'pi', agent_status: 'working', title: 'π - 37310', workspace_id: 'w1' } });
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:p9', agent: 'pi', agent_status: 'done', title: 'π - 37310', workspace_id: 'w1' } });
+  assert(notes[notes.length - 1].body === '状态：已完成 · Reflow (w1) · π - 37310', 'body = status + workspace label (id) + pane title');
+  // --- 13. fallbacks: no ws label -> raw id; no title -> plain body
+  w.wsLabels.clear();
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:p9', agent: 'pi', agent_status: 'working', title: 'π - 37310', workspace_id: 'w1' } });
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:p9', agent: 'pi', agent_status: 'idle', title: 'π - 37310', workspace_id: 'w1' } });
+  assert(notes[notes.length - 1].body === '状态：空闲 · w1 · π - 37310', 'no label -> workspace_id only');
+  w.handleEvent({ event: 'pane_updated', data: { pane: { pane_id: 'w1:pA', agent: 'pi', agent_status: 'working' } } });
+  w.handleEvent({ event: 'pane_updated', data: { pane: { pane_id: 'w1:pA', agent: 'pi', agent_status: 'idle' } } });
+  assert(notes[notes.length - 1].body === '状态：空闲', 'no meta -> plain body');
+  // --- 14. long title capped at 40 chars; closed removes meta
+  const long = 'x'.repeat(60);
+  w.handleEvent({ event: 'pane_updated', data: { pane: { pane_id: 'w1:pB', agent: 'pi', agent_status: 'working', title: long, workspace_id: 'w2' } } });
+  w.handleEvent({ event: 'pane_updated', data: { pane: { pane_id: 'w1:pB', agent: 'pi', agent_status: 'blocked', title: long, workspace_id: 'w2' } } });
+  assert(notes[notes.length - 1].body.includes('x'.repeat(37) + '…'), 'long title truncated with ellipsis');
+  w.handleEvent({ event: 'pane_exited', data: { pane_id: 'w1:pB', workspace_id: 'w1' } });
+  assert(!w.paneMeta.has('w1:pB'), 'pane_exited removes pane meta');
   console.log('done');
 })();

@@ -29,6 +29,20 @@ herdr server ──named pipe──▶ herdr-agent-notify.js ──notification.
 - Notifies only on `working → idle/done/blocked`. `unknown` statuses and
   agent-detection loop noise are ignored. A pane seen for the first time never
   triggers a toast.
+
+Notification content:
+
+```
+title: agent pi (w9:pD)
+body:  状态：已完成 · 37310 (w9) · π - 37310
+sound: done   (request for blocked)
+```
+
+- `title` = agent name + pane id
+- `body` = localized status label + workspace `label (id)` (label from
+  `workspace.list` cache; falls back to the bare id) + pane `title`
+  (falls back to `terminal_title`, truncated at 40 chars)
+- one transition, one toast: the two event channels are deduplicated
 - **One-shot startup hook, not a supervised daemon** (herdr plugin contract): the
   `[[startup]]` hook starts the watcher once per server start; the watcher then
   heals itself. If it ever dies, use the `start` action — `[[startup]]` will also
