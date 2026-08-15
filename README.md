@@ -40,6 +40,16 @@ herdr server ──named pipe──▶ herdr-agent-notify.js ──notification.
 - Notifies only on `working → idle/done/blocked`. `unknown` statuses and
   agent-detection loop noise are ignored. A pane seen for the first time never
   triggers a toast.
+- **Single system notifier**: herdr's built-in agent toasts (`[ui.toast]`
+  `delivery`) duplicate this plugin's work — the README companion config sets
+  `delivery = "herdr"` so built-in toasts stay in the TUI and the plugin owns
+  desktop notifications.
+- **Stale-focus guard**: the focused-pane skip only applies while the `focused`
+  flag is fresh (< 5s). If you switch away from a pane, its outdated `focused`
+  flag can no longer swallow the completion toast.
+- **Whole-cycle recovery**: if both event channels miss a `working → terminal`
+  transition (subscription rebuild gap), the 30s snapshot diff re-notifies it
+  instead of silently dropping it; state is re-aligned in both directions.
 
 Notification content:
 
@@ -58,6 +68,12 @@ sound: done   (request for blocked)
   `[[startup]]` hook starts the watcher once per server start; the watcher then
   heals itself. If it ever dies, use the `start` action — `[[startup]]` will also
   run again at the next server start.
+- **Exits when the server stays down**: bounded reconnect (`--down-exit-ms`,
+  default 120s). A clean server stop, crash, or kill all leave the pipe dead;
+  the watcher retries with backoff for the grace period and then exits — no
+  orphan process. A quick in-place server restart (within the grace period) is
+  taken over by the same watcher, so notifications never gap; if the restart
+  takes longer, the next server start's `[[startup]]` hook spawns a fresh one.
 
 ## Requirements
 
@@ -97,6 +113,7 @@ node herdr-agent-notify.js
 node herdr-agent-notify.js --name pi          # only monitor agent "pi"
 node herdr-agent-notify.js --refresh-ms 10000 # subscription refresh interval
 node herdr-agent-notify.js --cooldown-ms 5000 # per-pane anti-double-toast cooldown (default 10000)
+node herdr-agent-notify.js --down-exit-ms 60000 # exit after the server is unreachable this long (default 120000)
 node herdr-agent-notify.js --include-self     # also monitor your own pane
 node herdr-agent-notify.js --include-focused  # also notify for the focused pane
 node herdr-agent-notify.js --debug            # log every status transition

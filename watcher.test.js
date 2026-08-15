@@ -144,5 +144,39 @@ agents = [{ pane_id: 'w9:p9', agent: 'pi', agent_status: 'done' }];
   assert(notes.length === n18 + 2, '--include-focused: focused pane notifies');
   w.OPTS.includeFocused = false;
   w.OPTS.cooldownMs = 10000;
+
+  // --- 19. stale focused: focused 标记超过 5s 未刷新不再抑制通知
+  const n19 = notes.length;
+  w.OPTS.cooldownMs = 0;
+  w.subscribed.add('w1:pG');
+  w.handleEvent({ event: 'pane_updated', data: { pane: { pane_id: 'w1:pG', agent: 'pi', agent_status: 'working', focused: true } } });
+  w.paneMeta.get('w1:pG').focusedAt = Date.now() - 6000;   // 6s 前曾聚焦，现已过期
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:pG', agent: 'pi', agent_status: 'working' } });
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:pG', agent: 'pi', agent_status: 'idle' } });
+  assert(notes.length === n19 + 1, 'stale focused (>5s) does not suppress notification');
+  w.paneMeta.get('w1:pG').focusedAt = Date.now();          // 新鲜 focused 仍抑制
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:pG', agent: 'pi', agent_status: 'working' } });
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:pG', agent: 'pi', agent_status: 'idle' } });
+  assert(notes.length === n19 + 1, 'fresh focused still suppresses notification');
+  w.OPTS.cooldownMs = 10000;
+
+  // --- 20. refresh: 已知 pane 本地 idle、快照 done（working→done 整段丢失）→ 补发
+  const n20 = notes.length;
+  w.OPTS.cooldownMs = 0;
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w9:pM', agent: 'pi', agent_status: 'working' } });
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w9:pM', agent: 'pi', agent_status: 'idle' } });
+  agents = [{ pane_id: 'w9:pM', agent: 'pi', agent_status: 'done' }];   // 事件流未送达 done（模拟整段丢失）
+  await w.refresh('test-missed');
+  assert(notes.length === n20 + 1 && notes[notes.length - 1].sound === 'done', 'whole-cycle miss (idle->done) re-notified via snapshot');
+  // 已对齐后再刷新：无变化、不重复发
+  agents = [{ pane_id: 'w9:pM', agent: 'pi', agent_status: 'done' }];
+  await w.refresh('test-missed2');
+  assert(notes.length === n20 + 1, 'no duplicate after state aligned');
+  // --- 20b. 反向（done->working）只对齐不通知
+  const n20b = notes.length;
+  agents = [{ pane_id: 'w9:pM', agent: 'pi', agent_status: 'working' }];
+  await w.refresh('test-back');
+  assert(notes.length === n20b, 'terminal->working aligns silently');
+  w.OPTS.cooldownMs = 10000;
   console.log('done');
 })();

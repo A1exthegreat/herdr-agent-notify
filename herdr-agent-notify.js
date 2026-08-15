@@ -3,7 +3,8 @@
  * herdr-agent-notify.js — 事件驱动的 agent 状态系统通知
  *
  * 直连 herdr API 命名管道，生命周期与 herdr server 绑定：
- *   连接在 -> 工作；连接断 -> 指数退避重连；server 重启 -> 自动恢复。
+ *   连接在 -> 工作；连接断 -> 指数退避重连；server 原地重启 -> 自动恢复；
+ *   连续不可达超过 down-exit-ms（默认 2 分钟）-> 退出，不残留僵尸进程。
  * 通常以 herdr 插件形式运行（startup 命令，随 server 启停），也可独立运行。
  *
  * 事件模型（经实测验证，protocol 19）：
@@ -30,6 +31,7 @@
  *   node ... --name pi              # 只监控名为 pi 的 agent
  *   node ... --refresh-ms 10000     # 订阅刷新间隔（默认 30000）
  *   node ... --cooldown-ms 5000     # 同 pane 重复通知冷却期（默认 10000）
+ *   node ... --down-exit-ms 120000  # 服务器连续不可达超过该时长则退出（默认 120000）
  *   node ... --include-self         # 也监控自身 pane（默认跳过）
  *   node ... --debug                # 打印每次状态转换（排查双弹/漏报）
  * 插件命令由 herdr 以插件目录为 cwd 启动，相对路径即可；日志经 herdr 插件日志
@@ -53,6 +55,7 @@ const OPTS = {
   selfPane: process.env.HERDR_PANE_ID || null,
   refreshMs: Number.isFinite(refreshArg) ? Math.max(1000, refreshArg) : 30000,
   cooldownMs: Number.isFinite(parseInt(arg('--cooldown-ms') || '10000', 10)) ? Math.max(0, parseInt(arg('--cooldown-ms') || '10000', 10)) : 10000,
+  downExitMs: Number.isFinite(parseInt(arg('--down-exit-ms') || '120000', 10)) ? Math.max(1000, parseInt(arg('--down-exit-ms') || '120000', 10)) : 120000,
   debug: process.argv.includes('--debug'),
 };
 
@@ -100,10 +103,13 @@ const state = new Map();
 /** 已建立 per-pane 订阅的 pane：其状态只信 status_changed（pane_updated 高频伪影不进状态机） */
 const subscribed = new Set();
 
-/** pane_id -> { title, workspace_id }：通知展示用的 pane 上下文（事件/快照补充） */
+/** pane_id -> { title, workspace_id, focused, focusedAt }：通知展示用的 pane 上下文（事件/快照补充） */
 const paneMeta = new Map();
 /** workspace_id -> label：workspace.list 缓存（通知里展示工作区名） */
 const wsLabels = new Map();
+
+/** focused 标记的有效期：超过该时长未刷新则视为过期（避免切走焦点后仍被误跳过） */
+const FOCUS_GRACE_MS = 5000;
 
 /** 合并 pane 展示元数据（title/focused 可为空，空值不覆盖旧值） */
 function setPaneMeta(pid, title, workspaceId, focused) {
@@ -112,7 +118,7 @@ function setPaneMeta(pid, title, workspaceId, focused) {
   const m = paneMeta.get(pid) ?? {};
   if (t) m.title = t;
   if (workspaceId) m.workspace_id = workspaceId;
-  if (focused !== undefined) m.focused = focused;
+  if (focused !== undefined) { m.focused = focused; m.focusedAt = Date.now(); }
   paneMeta.set(pid, m);
 }
 
@@ -142,7 +148,9 @@ function maybeNotify(pid, name, prev, cur) {
   if (OPTS.nameFilter && name !== OPTS.nameFilter) return;
   if (!OPTS.includeSelf && pid === OPTS.selfPane) return; // 跳过自身 pane
   const meta = paneMeta.get(pid);
-  if (meta?.focused && !OPTS.includeFocused) return;       // 正在查看的 pane 不打扰（状态用户可见）
+  // 正在查看的 pane 不打扰（状态用户可见）；focused 标记超过 FOCUS_GRACE_MS 未刷新
+  // 则视为过期——用户早已切走，不能因为陈旧的 focused 吞掉本次通知
+  if (meta?.focused && !OPTS.includeFocused && Date.now() - (meta.focusedAt ?? 0) < FOCUS_GRACE_MS) return;
   const now = Date.now();
   if (now - (lastNotifyAt.get(pid) ?? 0) < OPTS.cooldownMs) return; // 冷却期内不重复弹
   lastNotifyAt.set(pid, now);
@@ -212,6 +220,10 @@ let conn = null;
 let refreshTimer = null;
 let refreshPending = false;
 let retryMs = 5000;
+/** 服务器连续不可达的起始时间：超过 OPTS.downExitMs 仍未恢复则退出（不残留僵尸进程）。
+ *  server 原地重启（< downExitMs）由旧 watcher 重连接管；超过宽限期后由下次 server
+ *  启动时的 startup hook 拉起新 watcher，两者之间无空窗。 */
+let downSince = null;
 
 /** 单实例保护：发现其他 herdr-agent-notify 进程则退出（防双通知） */
 function ensureSingleInstance() {
@@ -246,6 +258,7 @@ function subscribe() {
   let buf = Buffer.alloc(0);
   c.on('connect', () => {
     retryMs = 5000;   // 连接成功：重置退避
+    downSince = null; // 服务器恢复：清空连续不可达计时
     log('connected, subscribing', state.size, 'panes ...');
     c.write(JSON.stringify({ id: 'sub', method: 'events.subscribe', params: { subscriptions: buildSubs() } }) + '\n');
   });
@@ -263,6 +276,12 @@ function subscribe() {
     if (c.intentional) return;
     if (conn !== c) return;   // 已被新连接取代：不重复调度
     conn = null;
+    if (downSince === null) downSince = Date.now();
+    const downFor = Date.now() - downSince;
+    if (downFor > OPTS.downExitMs) {
+      log('server unreachable for', Math.round(downFor / 1000), 's, exiting');
+      process.exit(0);
+    }
     log('disconnected, reconnecting in', retryMs, 'ms');
     setTimeout(init, retryMs);
     retryMs = Math.min(60000, retryMs * 2);   // 指数退避，封顶 60s
@@ -300,6 +319,15 @@ async function refresh(reason) {
         transition(a.pane_id, a.agent ?? a.display_agent ?? null, a.agent_status);
       } else if (prev === 'working' && TERMINAL.has(a.agent_status)) {
         transition(a.pane_id, a.agent ?? a.display_agent ?? null, a.agent_status);  // 事件丢失兜底
+      } else if (prev !== a.agent_status) {
+        // 快照与本地状态不一致（非 working→终态）：事件可能整段丢失。
+        transition(a.pane_id, a.agent ?? a.display_agent ?? null, a.agent_status);  // 先静默对齐状态
+        if (TERMINAL.has(a.agent_status) && !TERMINAL.has(prev)) {
+          // 本地还停在非终态而快照已是终态：说明 working→终态 的转换从未被事件送达
+          // （订阅重建间隙/事件丢失）。以“我们认为它 working 过”补发一次通知，
+          // 复用 maybeNotify 的全部过滤（focused/自身/冷却/内容构造）。
+          maybeNotify(a.pane_id, a.agent ?? a.display_agent ?? null, 'working', a.agent_status);
+        }
       }
     }
     for (const pid of [...state.keys()]) if (!next.has(pid)) { state.delete(pid); subscribed.delete(pid); lastNotifyAt.delete(pid); }   // 瞬时 pane 修剪
