@@ -1,0 +1,7 @@
+# runtime artifacts
+watcher.log
+watcher.err
+
+# scratch / local
+.market-*
+*.local

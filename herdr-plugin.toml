@@ -1,0 +1,36 @@
+# herdr-agent-notify plugin manifest
+# - Runtime commands run with the plugin directory as cwd (herdr contract), so all
+#   paths below are relative. Runtime logs go to HERDR_PLUGIN_STATE_DIR (managed
+#   state dir), never into the plugin root (a managed source checkout when
+#   installed from GitHub).
+id = "herdr-agent-notify"
+name = "herdr-agent-notify"
+version = "1.0.0"
+min_herdr_version = "0.8.0"
+description = "Desktop notifications when agents finish working, need confirmation, or go idle"
+platforms = ["windows"]
+
+[[startup]]
+command = ["node", "herdr-agent-notify.js"]
+platforms = ["windows"]
+
+[[actions]]
+id = "status"
+title = "Watcher status"
+description = "Show whether the watcher is running"
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -match 'herdr-agent-notify' } | Select-Object ProcessId,CreationDate | Format-List"]
+
+[[actions]]
+id = "start"
+title = "Start watcher"
+description = "Launch the agent-notify watcher (hidden); logs go to the plugin state dir"
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-NonInteractive", "-Command", "if ($env:HERDR_PLUGIN_STATE_DIR) { $log = Join-Path $env:HERDR_PLUGIN_STATE_DIR 'watcher.log'; $err = Join-Path $env:HERDR_PLUGIN_STATE_DIR 'watcher.err' } else { $log = 'watcher.log'; $err = 'watcher.err' }; Start-Process node -ArgumentList 'herdr-agent-notify.js' -WindowStyle Hidden -RedirectStandardOutput $log -RedirectStandardError $err"]
+
+[[actions]]
+id = "stop"
+title = "Stop watcher"
+description = "Kill the agent-notify watcher process"
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -match 'herdr-agent-notify' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"]
