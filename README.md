@@ -27,6 +27,11 @@ herdr server ──named pipe──▶ herdr-agent-notify.js ──notification.
   would otherwise split one real transition into two toasts (or swallow it). New
   panes are covered best-effort via `pane_updated` until the next refresh
   subscribes them; a 10s per-pane cooldown (`--cooldown-ms`) is the final guard.
+- **No toasts for the pane you are looking at**: the pane currently focused in
+  the herdr UI is skipped (live `focused` flag from the event stream, plus the
+  launch-time `HERDR_PANE_ID` skip). Only background panes notify — so your own
+  agent's every tool call does not buzz you, but a background agent finishing
+  work does. `--include-focused` disables the focus skip.
 - **Self-healing**: exponential backoff reconnect (5s → 60s cap) when the server
   restarts; transitions missed while disconnected are re-notified from the next
   `agent.list` snapshot diff.
@@ -93,6 +98,7 @@ node herdr-agent-notify.js --name pi          # only monitor agent "pi"
 node herdr-agent-notify.js --refresh-ms 10000 # subscription refresh interval
 node herdr-agent-notify.js --cooldown-ms 5000 # per-pane anti-double-toast cooldown (default 10000)
 node herdr-agent-notify.js --include-self     # also monitor your own pane
+node herdr-agent-notify.js --include-focused  # also notify for the focused pane
 node herdr-agent-notify.js --debug            # log every status transition
 ```
 

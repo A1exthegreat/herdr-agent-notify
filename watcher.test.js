@@ -124,5 +124,25 @@ agents = [{ pane_id: 'w9:p9', agent: 'pi', agent_status: 'done' }];
   w.subscribed.add('w1:pT');
   w.handleEvent({ event: 'pane_updated', data: { pane: { pane_id: 'w1:pT', agent: 'pi', agent_status: 'working' } } });
   assert(w.state.get('w1:pT') === undefined, 'subscribed pane not tracked via pane_updated');
+
+  // --- 18. focused pane: no toast (user can see it); --include-focused overrides
+  const n18 = notes.length;
+  w.OPTS.cooldownMs = 0;
+  w.subscribed.add('w1:pF');
+  w.handleEvent({ event: 'pane_updated', data: { pane: { pane_id: 'w1:pF', agent: 'pi', agent_status: 'working', focused: true } } });
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:pF', agent: 'pi', agent_status: 'working' } });
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:pF', agent: 'pi', agent_status: 'idle' } });
+  assert(notes.length === n18, 'focused pane: no notification');
+  w.handleEvent({ event: 'pane_updated', data: { pane: { pane_id: 'w1:pF', agent: 'pi', agent_status: 'working', focused: false } } });
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:pF', agent: 'pi', agent_status: 'working' } });
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:pF', agent: 'pi', agent_status: 'idle' } });
+  assert(notes.length === n18 + 1, 'unfocused pane: notification fires');
+  w.OPTS.includeFocused = true;
+  w.handleEvent({ event: 'pane_updated', data: { pane: { pane_id: 'w1:pF', agent: 'pi', agent_status: 'working', focused: true } } });
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:pF', agent: 'pi', agent_status: 'working' } });
+  w.handleEvent({ event: 'pane.agent_status_changed', data: { pane_id: 'w1:pF', agent: 'pi', agent_status: 'idle' } });
+  assert(notes.length === n18 + 2, '--include-focused: focused pane notifies');
+  w.OPTS.includeFocused = false;
+  w.OPTS.cooldownMs = 10000;
   console.log('done');
 })();

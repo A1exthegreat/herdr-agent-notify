@@ -49,6 +49,8 @@ const refreshArg = parseInt(arg('--refresh-ms') || '30000', 10);
 const OPTS = {
   nameFilter: arg('--name') || null,
   includeSelf: process.argv.includes('--include-self'),
+  includeFocused: process.argv.includes('--include-focused'),
+  selfPane: process.env.HERDR_PANE_ID || null,
   refreshMs: Number.isFinite(refreshArg) ? Math.max(1000, refreshArg) : 30000,
   cooldownMs: Number.isFinite(parseInt(arg('--cooldown-ms') || '10000', 10)) ? Math.max(0, parseInt(arg('--cooldown-ms') || '10000', 10)) : 10000,
   debug: process.argv.includes('--debug'),
@@ -103,13 +105,14 @@ const paneMeta = new Map();
 /** workspace_id -> label：workspace.list 缓存（通知里展示工作区名） */
 const wsLabels = new Map();
 
-/** 合并 pane 展示元数据（title 可为 null，空值不覆盖旧值） */
-function setPaneMeta(pid, title, workspaceId) {
+/** 合并 pane 展示元数据（title/focused 可为空，空值不覆盖旧值） */
+function setPaneMeta(pid, title, workspaceId, focused) {
   const t = typeof title === 'string' ? title.trim() : '';
-  if (!t && !workspaceId) return;
+  if (!t && !workspaceId && focused === undefined) return;
   const m = paneMeta.get(pid) ?? {};
   if (t) m.title = t;
   if (workspaceId) m.workspace_id = workspaceId;
+  if (focused !== undefined) m.focused = focused;
   paneMeta.set(pid, m);
 }
 
@@ -138,12 +141,13 @@ function maybeNotify(pid, name, prev, cur) {
   if (!TERMINAL.has(cur)) return; // unknown/异常状态不打扰
   if (OPTS.nameFilter && name !== OPTS.nameFilter) return;
   if (!OPTS.includeSelf && pid === OPTS.selfPane) return; // 跳过自身 pane
+  const meta = paneMeta.get(pid);
+  if (meta?.focused && !OPTS.includeFocused) return;       // 正在查看的 pane 不打扰（状态用户可见）
   const now = Date.now();
   if (now - (lastNotifyAt.get(pid) ?? 0) < OPTS.cooldownMs) return; // 冷却期内不重复弹
   lastNotifyAt.set(pid, now);
 
   const who = name ? `${name} (${pid})` : pid;
-  const meta = paneMeta.get(pid);
   const ctx = [];
   if (meta?.workspace_id) {
     const label = wsLabels.get(meta.workspace_id);
@@ -195,7 +199,7 @@ function handleEvent(msg) {
   if (ev === 'pane.updated') {
     const pane = data.pane;
     if (!pane?.pane_id || !pane.agent) return;               // 无 agent 的 pane 不关心
-    setPaneMeta(pane.pane_id, pane.title ?? pane.terminal_title, pane.workspace_id);
+    setPaneMeta(pane.pane_id, pane.title ?? pane.terminal_title, pane.workspace_id, pane.focused);
     if (subscribed.has(pane.pane_id)) return;                 // 已订阅：状态以 status_changed 为准，
                                                               // 忽略检测循环伪影（working/idle 每秒翻转）
     const st = pane.agent_status ?? 'unknown';                // 未订阅（新 pane/订阅未建立）：best-effort，
@@ -279,8 +283,8 @@ async function refresh(reason) {
   refreshPending = true;
   try {
     const agents = await snapshotAgents();
-    // 展示元数据：pane title/workspace + 工作区 label 缓存（通知内容用；失败不影响状态同步）
-    for (const a of agents) if (a.pane_id) setPaneMeta(a.pane_id, a.title ?? a.terminal_title, a.workspace_id);
+    // 展示元数据：pane title/workspace/聚焦态 + 工作区 label 缓存（通知内容用；失败不影响状态同步）
+    for (const a of agents) if (a.pane_id) setPaneMeta(a.pane_id, a.title ?? a.terminal_title, a.workspace_id, a.focused);
     try {
       const ws = await rpcOnce('workspace.list', {});
       wsLabels.clear();
@@ -330,7 +334,7 @@ async function init() {
 }
 
 async function main() {
-  log('herdr-agent-notify starting (refresh=' + OPTS.refreshMs + 'ms)');
+  log('herdr-agent-notify starting (refresh=' + OPTS.refreshMs + 'ms, self=' + (OPTS.selfPane ?? 'none') + ', cooldown=' + OPTS.cooldownMs + 'ms)');
   await ensureSingleInstance();
   init();
   const onExit = () => { log('stopped'); process.exit(0); };
